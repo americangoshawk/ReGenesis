@@ -81,7 +81,6 @@ class TestRegenesis(unittest.TestCase):
     def test_get_color_distribution(self):
         """Test getting color distribution of selected plants."""
         plants = self.app.get_all_plants()
-        print("Hello World")
         # Select a few plants
         self.app.add_plant_to_selection(plants[0])
         self.app.add_plant_to_selection(plants[1])

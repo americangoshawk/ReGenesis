@@ -1,4 +1,5 @@
 import random
+import json
 from plant_container import PlantContainer
 
 
@@ -76,3 +77,50 @@ class Regenesis:
         for plant in self.selected_plants:
             color_counts[plant.color] = color_counts.get(plant.color, 0) + 1
         return color_counts
+
+    def save_to_file(self, filepath):
+        """Save the current project to a JSON file."""
+        project_data = {
+            "plot_dimensions": {
+                "width": self.plot_width,
+                "height": self.plot_height
+            },
+            "selected_plants": [
+                {
+                    "name": plant.name,
+                    "height": plant.height,
+                    "color": plant.color
+                }
+                for plant in self.selected_plants
+            ]
+        }
+
+        with open(filepath, 'w') as f:
+            json.dump(project_data, f, indent=2)
+
+    def load_from_file(self, filepath):
+        """Load a project from a JSON file."""
+        with open(filepath, 'r') as f:
+            project_data = json.load(f)
+
+        # Restore plot dimensions
+        dims = project_data.get("plot_dimensions", {})
+        self.plot_width = dims.get("width")
+        self.plot_height = dims.get("height")
+
+        # Restore selected plants
+        self.selected_plants = []
+        for plant_data in project_data.get("selected_plants", []):
+            # Find matching plant in database
+            for plant in self.get_all_plants():
+                if (plant.name == plant_data["name"] and
+                    plant.height == plant_data["height"] and
+                    plant.color == plant_data["color"]):
+                    self.selected_plants.append(plant)
+                    break
+
+    def new_project(self):
+        """Start a new project by clearing current selections."""
+        self.plot_width = None
+        self.plot_height = None
+        self.selected_plants = []

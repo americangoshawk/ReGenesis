@@ -36,30 +36,28 @@ class PlantContainer:
 
 # Create the container and populate with 9 native plants
 def create_plant_database():
-    """Create and populate a database of 9 native plants with random attributes."""
+    """Create and populate a database of 9 native plants with specific colors and random heights."""
     container = PlantContainer()
 
-    # Common native plant names
-    plant_names = [
-        "Purple Coneflower",
-        "Black-Eyed Susan",
-        "Wild Bergamot",
-        "Butterfly Weed",
-        "New England Aster",
-        "Joe Pye Weed",
-        "Wild Columbine",
-        "Goldenrod",
-        "Blazing Star"
+    # Native plants with their characteristic colors
+    plants_data = [
+        ("Purple Coneflower", "purple"),
+        ("Black-Eyed Susan", "yellow"),
+        ("Wild Bergamot", "pink"),
+        ("Butterfly Weed", "orange"),
+        ("New England Aster", "purple"),
+        ("Joe Pye Weed", "purple"),
+        ("Wild Columbine", "red"),
+        ("Goldenrod", "yellow"),
+        ("Blazing Star", "purple")
     ]
 
-    # Possible attributes
+    # Possible heights
     heights = [1, 2, 3, 4]
-    colors = ["white", "yellow", "purple", "pink"]
 
-    # Add 9 plants with random attributes
-    for name in plant_names:
+    # Add plants with random heights but specific colors
+    for name, color in plants_data:
         height = random.choice(heights)
-        color = random.choice(colors)
         container.add_plant(name, height, color)
 
     return container
