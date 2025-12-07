@@ -17,7 +17,24 @@ def main():
             # Foundation module not available, menu will show 'Python'
             pass
 
+    # Create GUI (which will set the icon)
     gui = RegenesisGUI()
+
+    # Set dock icon after tkinter is initialized
+    if sys.platform == 'darwin':
+        try:
+            from Foundation import NSImage
+            import AppKit
+            import os
+
+            icon_path = os.path.join(os.path.dirname(__file__), 'oak_leaf.icns')
+            if os.path.exists(icon_path):
+                image = NSImage.alloc().initWithContentsOfFile_(icon_path)
+                if image and AppKit.NSApp:
+                    AppKit.NSApp.setApplicationIconImage_(image)
+        except (ImportError, AttributeError):
+            pass
+
     gui.run()
 
 
