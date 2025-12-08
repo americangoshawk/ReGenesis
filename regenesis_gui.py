@@ -49,7 +49,16 @@ class RegenesisGUI:
         splash.update()  # Keep splash responsive
 
         self.root.title("Regenesis - Native Plant Designer")
-        self.root.geometry("1000x700")
+
+        # Center the main window on the screen (same monitor as splash)
+        window_width = 1000
+        window_height = 700
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
+        x = (screen_width - window_width) // 2
+        y = (screen_height - window_height) // 2
+        self.root.geometry(f"{window_width}x{window_height}+{x}+{y}")
         self.current_file = None  # Track the currently open file
         self.selected_item = None  # Track selected tree item
         self._updating_properties = False  # Flag to prevent update loops
@@ -64,6 +73,8 @@ class RegenesisGUI:
         self._pan_start_x = 0  # Track panning start position
         self._pan_start_y = 0
         self._is_panning = False
+        self._current_project_item = None  # Track which project is displayed
+        self._has_auto_zoomed = False  # Track if we've auto-zoomed for current project
 
         # Drawing mode state
         self.drawing_mode = False  # True when in drawing mode
@@ -105,12 +116,15 @@ class RegenesisGUI:
         # Set size and center the splash screen
         width = 400
         height = 300
-        splash.update_idletasks()
-        screen_width = splash.winfo_screenwidth()
-        screen_height = splash.winfo_screenheight()
+
+        # Get screen dimensions from the root window (which knows about the main monitor)
+        self.root.update_idletasks()
+        screen_width = self.root.winfo_screenwidth()
+        screen_height = self.root.winfo_screenheight()
         x = (screen_width - width) // 2
         y = (screen_height - height) // 2
         splash.geometry(f"{width}x{height}+{x}+{y}")
+        splash.update_idletasks()
 
         # Remove window decorations
         splash.overrideredirect(True)
@@ -404,8 +418,8 @@ class RegenesisGUI:
         self.canvas = tk.Canvas(canvas_container, bg='#f0f0f0', highlightthickness=0)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Bind canvas resize to update rulers
-        self.canvas.bind('<Configure>', lambda _e: self._update_rulers())
+        # Bind canvas resize to update rulers and reposition items
+        self.canvas.bind('<Configure>', lambda _e: self._on_canvas_resize())
 
         # Bind canvas pan/zoom events
         self.canvas.bind('<Button-2>', self._start_pan)  # Middle click on macOS (Button-2)
@@ -957,8 +971,10 @@ class RegenesisGUI:
         # Auto-select the project root to show the rectangle
         self.tree.selection_set(root)
         self.tree.focus(root)
-        # Trigger the selection event to update the workspace
-        self._on_tree_select(None)
+
+        # Defer workspace update until window is properly sized
+        # Use after with delay to ensure canvas is fully rendered
+        self.root.after(100, lambda: self._on_tree_select(None))
 
         self._log_info("Loaded sample project: Smith Residence (Development Mode)")
 
@@ -1057,10 +1073,11 @@ class RegenesisGUI:
         except Exception as e:
             self._log_error(f"Failed to apply property change: {e}")
 
-    def _update_workspace(self, name, item_type):
+    def _update_workspace(self, name, item_type, retry_count=0):
         """Update the workspace canvas to display the selected item."""
         # Don't update workspace if we're in drawing mode (preserve the polygon)
         if self.drawing_mode:
+            self._log_info(f"Update workspace skipped - in drawing mode")
             return
 
         # Clear canvas
@@ -1070,17 +1087,35 @@ class RegenesisGUI:
         self.canvas.update_idletasks()
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
+
+        # Check if canvas is properly sized, if not skip this update
+        if width < 10 or height < 10:
+            if retry_count < 50:  # Limit retries to prevent infinite loop
+                # Try again in 100ms
+                self.root.after(100, lambda: self._update_workspace(name, item_type, retry_count + 1))
+            else:
+                self._log_error(f"Canvas failed to size properly after {retry_count} retries")
+            return
+
         center_x = width / 2
         center_y = height / 2
+
+        self._log_info(f"Update workspace: {name} ({item_type}), canvas: {width}x{height}")
 
         # Display item info
         if item_type == 'project':
             text = f"Project: {name}"
             color = "#2c3e50"
 
+            # Check if we switched to a different project
+            if self.selected_item != self._current_project_item:
+                self._current_project_item = self.selected_item
+                self._has_auto_zoomed = False  # Reset auto-zoom flag for new project
+
             # Auto-draw rectangle if project has both dimensions defined
             if self.selected_item:
                 item_values = self.tree.item(self.selected_item, 'values')
+                self._log_info(f"Project values: {item_values}")
                 try:
                     project_width_str = item_values[3] if len(item_values) > 3 else ''
                     project_length_str = item_values[4] if len(item_values) > 4 else ''
@@ -1088,16 +1123,53 @@ class RegenesisGUI:
                     if project_width_str and project_length_str:
                         project_width = float(project_width_str)
                         project_length = float(project_length_str)
+                        self._log_info(f"Drawing project rectangle: {project_width} x {project_length}")
 
                         if project_width > 0 and project_length > 0:
-                            # Convert to pixels (50 pixels = 1 unit)
-                            rect_width = project_width * 50
-                            rect_height = project_length * 50
+                            # Convert to pixels (50 pixels = 1 unit at zoom 1.0, scaled by current zoom)
+                            pixels_per_unit = 50 * self.canvas_zoom
+                            rect_width = project_width * pixels_per_unit
+                            rect_height = project_length * pixels_per_unit
 
-                            x1 = center_x - rect_width / 2
-                            y1 = center_y - rect_height / 2
-                            x2 = center_x + rect_width / 2
-                            y2 = center_y + rect_height / 2
+                            # Center rectangle around canvas center (which represents 0,0 in project coords)
+                            # Account for pan offset
+                            origin_x = center_x + self.canvas_pan_x
+                            origin_y = center_y + self.canvas_pan_y
+
+                            x1 = origin_x - rect_width / 2
+                            y1 = origin_y - rect_height / 2
+                            x2 = origin_x + rect_width / 2
+                            y2 = origin_y + rect_height / 2
+
+                            self._log_info(f"Rectangle coords: ({x1}, {y1}) to ({x2}, {y2}) at zoom {self.canvas_zoom}")
+
+                            # Auto-zoom to fit rectangle if it's too large for canvas (only once per project)
+                            if not self._has_auto_zoomed:
+                                # Add 20% margin
+                                required_width = rect_width * 1.2
+                                required_height = rect_height * 1.2
+
+                                # Calculate zoom needed to fit
+                                zoom_for_width = width / required_width
+                                zoom_for_height = height / required_height
+                                auto_zoom = min(zoom_for_width, zoom_for_height)
+
+                                # Only auto-zoom if rectangle is too large
+                                if auto_zoom < self.canvas_zoom:
+                                    self.canvas_zoom = auto_zoom
+                                    self._log_info(f"Auto-zoomed to {auto_zoom:.3f} to fit rectangle")
+
+                                    # Recalculate rectangle with new zoom
+                                    pixels_per_unit = 50 * self.canvas_zoom
+                                    rect_width = project_width * pixels_per_unit
+                                    rect_height = project_length * pixels_per_unit
+
+                                    x1 = origin_x - rect_width / 2
+                                    y1 = origin_y - rect_height / 2
+                                    x2 = origin_x + rect_width / 2
+                                    y2 = origin_y + rect_height / 2
+
+                                self._has_auto_zoomed = True  # Mark that we've auto-zoomed
 
                             # Draw unfilled rectangle outline
                             self.canvas.create_rectangle(
@@ -1108,11 +1180,15 @@ class RegenesisGUI:
                                 tags='project_boundary'
                             )
 
+                            # Draw origin marker (plus sign at 0,0)
+                            self._draw_origin_marker()
+
                             # Update rulers
                             self._update_rulers()
+                            self._log_info("Project rectangle drawn successfully")
                             return  # Don't show text if we drew the rectangle
-                except (ValueError, IndexError):
-                    pass
+                except (ValueError, IndexError) as e:
+                    self._log_error(f"Error drawing project rectangle: {e}")
 
         elif item_type == 'region':
             text = f"Region: {name}"
@@ -1537,6 +1613,62 @@ class RegenesisGUI:
         widget.bind('<Leave>', on_leave)
 
     # Canvas Pan/Zoom Methods
+
+    def _on_canvas_resize(self):
+        """Handle canvas resize - update rulers and reposition project items."""
+        # Update rulers (which also redraws origin marker)
+        self._update_rulers()
+
+        # If we're viewing a project with a rectangle, redraw it at the new canvas center
+        if self.selected_item and not self.drawing_mode:
+            item_values = self.tree.item(self.selected_item, 'values')
+            if item_values and len(item_values) > 0 and item_values[0] == 'project':
+                # Check if project has dimensions (rectangle should be shown)
+                if len(item_values) > 4:
+                    project_width_str = item_values[3]
+                    project_length_str = item_values[4]
+                    if project_width_str and project_length_str:
+                        try:
+                            project_width = float(project_width_str)
+                            project_length = float(project_length_str)
+
+                            if project_width > 0 and project_length > 0:
+                                # Redraw the rectangle at the new canvas center
+                                self._redraw_project_rectangle(project_width, project_length)
+                        except (ValueError, IndexError):
+                            pass
+
+    def _redraw_project_rectangle(self, project_width, project_length):
+        """Redraw the project rectangle centered at the origin."""
+        # Get current canvas dimensions
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        center_x = width / 2
+        center_y = height / 2
+
+        # Calculate rectangle dimensions with current zoom
+        pixels_per_unit = 50 * self.canvas_zoom
+        rect_width = project_width * pixels_per_unit
+        rect_height = project_length * pixels_per_unit
+
+        # Calculate position centered at origin
+        origin_x = center_x + self.canvas_pan_x
+        origin_y = center_y + self.canvas_pan_y
+
+        x1 = origin_x - rect_width / 2
+        y1 = origin_y - rect_height / 2
+        x2 = origin_x + rect_width / 2
+        y2 = origin_y + rect_height / 2
+
+        # Delete old rectangle and redraw
+        self.canvas.delete('project_boundary')
+        self.canvas.create_rectangle(
+            x1, y1, x2, y2,
+            outline='#3498db',
+            width=2,
+            dash=(5, 3),
+            tags='project_boundary'
+        )
 
     def _space_pressed(self, _event):
         """Handle space key press for panning mode."""
@@ -2046,11 +2178,73 @@ class RegenesisGUI:
         # Update rulers
         self._update_rulers()
 
+    def _calculate_tick_interval(self, visible_range):
+        """Calculate an appropriate tick interval to show ~15 ticks.
+
+        Args:
+            visible_range: The visible range in units (feet or meters)
+
+        Returns:
+            A nice round number for tick spacing
+        """
+        # Target around 15 ticks
+        target_ticks = 15
+        raw_interval = visible_range / target_ticks
+
+        # Nice intervals to choose from
+        nice_intervals = [
+            0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000
+        ]
+
+        # Find the closest nice interval
+        best_interval = nice_intervals[0]
+        for interval in nice_intervals:
+            if interval >= raw_interval:
+                best_interval = interval
+                break
+        else:
+            best_interval = nice_intervals[-1]
+
+        return best_interval
+
+    def _draw_origin_marker(self):
+        """Draw a fixed-size origin marker at (0,0) that doesn't scale with zoom."""
+        # Get canvas center (which represents 0,0 in project coordinates)
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        center_x = width / 2
+        center_y = height / 2
+
+        # Calculate the screen position of origin accounting for pan
+        origin_screen_x = center_x + self.canvas_pan_x
+        origin_screen_y = center_y + self.canvas_pan_y
+
+        # Fixed marker size in pixels (doesn't change with zoom)
+        marker_size = 10
+
+        # Delete old origin marker
+        self.canvas.delete('origin_marker')
+
+        # Draw new origin marker
+        self.canvas.create_line(
+            origin_screen_x - marker_size, origin_screen_y,
+            origin_screen_x + marker_size, origin_screen_y,
+            fill='#e74c3c', width=2, tags='origin_marker'
+        )
+        self.canvas.create_line(
+            origin_screen_x, origin_screen_y - marker_size,
+            origin_screen_x, origin_screen_y + marker_size,
+            fill='#e74c3c', width=2, tags='origin_marker'
+        )
+
     def _update_rulers(self):
         """Update the ruler markings based on current zoom and pan."""
         # Clear existing rulers
         self.ruler_top.delete('all')
         self.ruler_left.delete('all')
+
+        # Redraw origin marker with updated position
+        self._draw_origin_marker()
 
         # Get dimensions
         canvas_width = self.canvas.winfo_width()
@@ -2061,37 +2255,83 @@ class RegenesisGUI:
         # Pixels per unit (50 pixels = 1 unit at zoom 1.0)
         pixels_per_unit = 50 * self.canvas_zoom
 
+        # Calculate visible range in units
+        visible_width_units = canvas_width / pixels_per_unit
+        visible_height_units = canvas_height / pixels_per_unit
+
+        # Calculate appropriate tick intervals
+        h_interval = self._calculate_tick_interval(visible_width_units)
+        v_interval = self._calculate_tick_interval(visible_height_units)
+
         # Draw top ruler (horizontal)
         # Draw background
         self.ruler_top.create_rectangle(0, 0, ruler_top_width, 25, fill='#e8e8e8', outline='#999999')
 
-        # Calculate starting position accounting for pan
-        start_unit = -self.canvas_pan_x / pixels_per_unit
-        num_units = int(canvas_width / pixels_per_unit) + 2
+        # Canvas center represents (0,0) in project coordinates
+        canvas_center_x = canvas_width / 2
 
-        for i in range(int(start_unit) - 1, int(start_unit) + num_units + 1):
-            x_pos = (i * pixels_per_unit) + self.canvas_pan_x
-            if 0 <= x_pos <= ruler_top_width:
+        # Ruler top includes 40px offset for the left ruler
+        ruler_offset_x = 40
+
+        # Calculate starting position accounting for pan
+        # Position 0 should be at canvas_center + pan_x
+        start_unit = -(canvas_center_x + self.canvas_pan_x) / pixels_per_unit
+
+        # Round down to nearest interval
+        first_tick = int(start_unit / h_interval) * h_interval
+
+        # Draw ticks
+        current_tick = first_tick
+        while True:
+            # Calculate screen position for this tick on the ruler (offset by 40px)
+            x_pos = (current_tick * pixels_per_unit) + canvas_center_x + self.canvas_pan_x + ruler_offset_x
+            if x_pos > ruler_top_width:
+                break
+            if x_pos >= ruler_offset_x:  # Don't draw in the corner reserved for ruler_left
                 # Draw tick mark
-                self.ruler_top.create_line(x_pos, 20, x_pos, 25, fill='#333333')
-                # Draw label
-                self.ruler_top.create_text(x_pos, 10, text=str(i), font=("Arial", 8), fill='#333333')
+                self.ruler_top.create_line(x_pos, 20, x_pos, 25, fill='#333333', width=2)
+                # Format label based on interval (avoid unnecessary decimals)
+                if h_interval >= 1:
+                    label = str(int(current_tick))
+                else:
+                    label = f"{current_tick:.1f}"
+                self.ruler_top.create_text(x_pos, 10, text=label, font=("Arial", 8), fill='#333333')
+            current_tick += h_interval
 
         # Draw left ruler (vertical)
         # Draw background
         self.ruler_left.create_rectangle(0, 0, 40, ruler_left_height, fill='#e8e8e8', outline='#999999')
 
-        # Calculate starting position accounting for pan
-        start_unit = -self.canvas_pan_y / pixels_per_unit
-        num_units = int(canvas_height / pixels_per_unit) + 2
+        # Canvas center represents (0,0) in project coordinates
+        canvas_center_y = canvas_height / 2
 
-        for i in range(int(start_unit) - 1, int(start_unit) + num_units + 1):
-            y_pos = (i * pixels_per_unit) + self.canvas_pan_y
-            if 0 <= y_pos <= ruler_left_height:
+        # Ruler left is vertically aligned with canvas (no offset needed)
+        # Both start below the top ruler
+
+        # Calculate starting position accounting for pan
+        # Position 0 should be at canvas_center + pan_y
+        start_unit = -(canvas_center_y + self.canvas_pan_y) / pixels_per_unit
+
+        # Round down to nearest interval
+        first_tick = int(start_unit / v_interval) * v_interval
+
+        # Draw ticks
+        current_tick = first_tick
+        while True:
+            # Calculate screen position for this tick on the ruler
+            y_pos = (current_tick * pixels_per_unit) + canvas_center_y + self.canvas_pan_y
+            if y_pos > ruler_left_height:
+                break
+            if y_pos >= 0:
                 # Draw tick mark
-                self.ruler_left.create_line(35, y_pos, 40, y_pos, fill='#333333')
-                # Draw label (rotated text would be nice but tkinter doesn't support it well)
-                self.ruler_left.create_text(18, y_pos, text=str(i), font=("Arial", 8), fill='#333333')
+                self.ruler_left.create_line(35, y_pos, 40, y_pos, fill='#333333', width=2)
+                # Format label based on interval (avoid unnecessary decimals)
+                if v_interval >= 1:
+                    label = str(int(current_tick))
+                else:
+                    label = f"{current_tick:.1f}"
+                self.ruler_left.create_text(18, y_pos, text=label, font=("Arial", 8), fill='#333333')
+            current_tick += v_interval
 
     def run(self):
         """Start the GUI application."""
