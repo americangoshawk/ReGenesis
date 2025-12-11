@@ -83,6 +83,12 @@ class RegenesisGUI:
         self.vertex_handles = []  # List of canvas circle IDs for vertices
         self.selected_vertex = None  # Index of selected vertex
         self._dragging_vertex = False
+        self.region_polygons = {}  # Dict mapping tree item IDs to polygon vertices
+
+        # Track drag state for tree drag-and-drop
+        self._drag_start_x = 0
+        self._drag_start_y = 0
+        self._has_moved = False
 
         # Setup UI
         splash.update()
@@ -376,15 +382,8 @@ class RegenesisGUI:
         # Workspace label
         tk.Label(toolbar_frame, text="Workspace", font=("Arial", 14, "bold"), bg='#e0e0e0').pack(side=tk.LEFT, padx=10)
 
-        # Drawing mode toggle button
-        self.draw_mode_button = ttk.Button(
-            toolbar_frame,
-            text="Draw Rectangle",
-            command=self._toggle_drawing_mode,
-            bootstyle="success",
-            width=15
-        )
-        self.draw_mode_button.pack(side=tk.LEFT, padx=5)
+        # Drawing mode toggle button (now starts drawing immediately when viewing a region)
+        # Removed - drawing starts automatically, exits when switching nodes
 
         # Clear polygon button
         self.clear_polygon_button = ttk.Button(
@@ -396,6 +395,7 @@ class RegenesisGUI:
             state=tk.DISABLED
         )
         self.clear_polygon_button.pack(side=tk.LEFT, padx=5)
+        self._clear_button_visible = True  # Track visibility to avoid unnecessary pack/unpack
 
         # Canvas/Workspace section (takes most of the space)
         canvas_section = tk.Frame(workspace_frame, bg='white')
@@ -529,6 +529,10 @@ class RegenesisGUI:
         # Populate with sample data (only in development mode)
         if self.prefs.is_development_mode():
             self._populate_sample_tree()
+        else:
+            # Show helpful message when tree is empty
+            self._log_info("No projects loaded. Use File → New to create a project.")
+            self._show_empty_tree_message()
 
     def _create_menu(self):
         """Create the menu bar with File menu."""
@@ -933,6 +937,31 @@ class RegenesisGUI:
         except Exception as e:
             messagebox.showerror("Theme Error", f"Could not apply theme: {str(e)}")
 
+    def _show_empty_tree_message(self):
+        """Display a helpful message in the canvas when no projects are loaded."""
+        # Get canvas dimensions
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+        center_x = width // 2
+        center_y = height // 2
+
+        # Display welcome message
+        self.canvas.create_text(
+            center_x, center_y - 40,
+            text="Welcome to ReGenesis",
+            font=("Arial", 24, "bold"),
+            fill="#2c3e50",
+            justify=tk.CENTER
+        )
+
+        self.canvas.create_text(
+            center_x, center_y + 20,
+            text="No projects loaded\n\nUse File → New to create a project\nor File → Open to load an existing one",
+            font=("Arial", 14),
+            fill="#7f8c8d",
+            justify=tk.CENTER
+        )
+
     def _populate_sample_tree(self):
         """Populate the tree with sample design structure."""
         # Root node - the project itself
@@ -980,6 +1009,25 @@ class RegenesisGUI:
 
     def _on_tree_select(self, event):
         """Handle tree selection event."""
+        import time
+        start_time = time.time()
+        self._log_info("=== Tree select START ===")
+
+        # Save current polygon if in drawing mode
+        if self.drawing_mode and self.selected_item and self.polygon_vertices:
+            self.region_polygons[self.selected_item] = list(self.polygon_vertices)
+            self._log_info(f"Saved polygon with {len(self.polygon_vertices)} vertices")
+
+        # Exit drawing mode when switching nodes
+        if self.drawing_mode:
+            self.drawing_mode = False
+            self.canvas.config(cursor='')
+            # Hide the Clear Shape button when exiting drawing mode (only if currently visible)
+            if self._clear_button_visible:
+                self.clear_polygon_button.pack_forget()
+                self._clear_button_visible = False
+            self._log_info("Exited drawing mode (node switch)")
+
         selection = self.tree.selection()
         if not selection:
             return
@@ -1027,7 +1075,14 @@ class RegenesisGUI:
         self._updating_properties = False
 
         # Update workspace canvas
+        before_workspace = time.time()
         self._update_workspace(item_text, item_type)
+        after_workspace = time.time()
+
+        self._log_info(f"_update_workspace took {(after_workspace - before_workspace)*1000:.0f}ms")
+
+        total_elapsed = time.time() - start_time
+        self._log_info(f"=== Tree select COMPLETE: {total_elapsed*1000:.0f}ms ===")
 
     def _apply_property_change(self):
         """Apply property changes to the selected tree item."""
@@ -1075,10 +1130,8 @@ class RegenesisGUI:
 
     def _update_workspace(self, name, item_type, retry_count=0):
         """Update the workspace canvas to display the selected item."""
-        # Don't update workspace if we're in drawing mode (preserve the polygon)
-        if self.drawing_mode:
-            self._log_info(f"Update workspace skipped - in drawing mode")
-            return
+        import time
+        ws_start = time.time()
 
         # Clear canvas
         self.canvas.delete('all')
@@ -1100,110 +1153,45 @@ class RegenesisGUI:
         center_x = width / 2
         center_y = height / 2
 
-        self._log_info(f"Update workspace: {name} ({item_type}), canvas: {width}x{height}")
-
-        # Display item info
-        if item_type == 'project':
-            text = f"Project: {name}"
-            color = "#2c3e50"
-
+        # STEP 1: Always find and draw the project rectangle
+        project_item = self._find_project_root()
+        if project_item:
             # Check if we switched to a different project
-            if self.selected_item != self._current_project_item:
-                self._current_project_item = self.selected_item
+            if project_item != self._current_project_item:
+                self._current_project_item = project_item
                 self._has_auto_zoomed = False  # Reset auto-zoom flag for new project
 
-            # Auto-draw rectangle if project has both dimensions defined
-            if self.selected_item:
-                item_values = self.tree.item(self.selected_item, 'values')
-                self._log_info(f"Project values: {item_values}")
-                try:
-                    project_width_str = item_values[3] if len(item_values) > 3 else ''
-                    project_length_str = item_values[4] if len(item_values) > 4 else ''
+            self._draw_project_rectangle(project_item, width, height, center_x, center_y)
 
-                    if project_width_str and project_length_str:
-                        project_width = float(project_width_str)
-                        project_length = float(project_length_str)
-                        self._log_info(f"Drawing project rectangle: {project_width} x {project_length}")
+        # STEP 2: Always draw ALL saved region polygons (not editable, just display)
+        self._draw_all_region_polygons()
 
-                        if project_width > 0 and project_length > 0:
-                            # Convert to pixels (50 pixels = 1 unit at zoom 1.0, scaled by current zoom)
-                            pixels_per_unit = 50 * self.canvas_zoom
-                            rect_width = project_width * pixels_per_unit
-                            rect_height = project_length * pixels_per_unit
+        # STEP 3: Always draw origin marker and rulers on top
+        self._draw_origin_marker()
+        self._update_rulers()
 
-                            # Center rectangle around canvas center (which represents 0,0 in project coords)
-                            # Account for pan offset
-                            origin_x = center_x + self.canvas_pan_x
-                            origin_y = center_y + self.canvas_pan_y
+        # STEP 4: If viewing a region, enable drawing mode for THAT region (makes it editable)
+        if item_type == 'region':
+            if self.selected_item in self.region_polygons:
+                # Restore the saved polygon and enable drawing mode for editing
+                self.drawing_mode = True
+                saved_vertices = self.region_polygons[self.selected_item]
+                self.polygon_vertices = list(saved_vertices)
+                self._redraw_polygon()
+                # Show and enable the Clear Shape button (only if not already visible)
+                if not self._clear_button_visible:
+                    self.clear_polygon_button.pack(side=tk.LEFT, padx=5)
+                    self._clear_button_visible = True
+                self.clear_polygon_button.config(state=tk.NORMAL)
+                self._log_info(f"Enabled editing for polygon with {len(self.polygon_vertices)} vertices")
+            else:
+                # No saved polygon, start drawing mode automatically
+                self.drawing_mode = True
+                self._create_default_rectangle()
+                self._log_info("Drawing mode enabled - rectangle created for region")
 
-                            x1 = origin_x - rect_width / 2
-                            y1 = origin_y - rect_height / 2
-                            x2 = origin_x + rect_width / 2
-                            y2 = origin_y + rect_height / 2
-
-                            self._log_info(f"Rectangle coords: ({x1}, {y1}) to ({x2}, {y2}) at zoom {self.canvas_zoom}")
-
-                            # Auto-zoom to fit rectangle if it's too large for canvas (only once per project)
-                            if not self._has_auto_zoomed:
-                                # Add 20% margin
-                                required_width = rect_width * 1.2
-                                required_height = rect_height * 1.2
-
-                                # Calculate zoom needed to fit
-                                zoom_for_width = width / required_width
-                                zoom_for_height = height / required_height
-                                auto_zoom = min(zoom_for_width, zoom_for_height)
-
-                                # Only auto-zoom if rectangle is too large
-                                if auto_zoom < self.canvas_zoom:
-                                    self.canvas_zoom = auto_zoom
-                                    self._log_info(f"Auto-zoomed to {auto_zoom:.3f} to fit rectangle")
-
-                                    # Recalculate rectangle with new zoom
-                                    pixels_per_unit = 50 * self.canvas_zoom
-                                    rect_width = project_width * pixels_per_unit
-                                    rect_height = project_length * pixels_per_unit
-
-                                    x1 = origin_x - rect_width / 2
-                                    y1 = origin_y - rect_height / 2
-                                    x2 = origin_x + rect_width / 2
-                                    y2 = origin_y + rect_height / 2
-
-                                self._has_auto_zoomed = True  # Mark that we've auto-zoomed
-
-                            # Draw unfilled rectangle outline
-                            self.canvas.create_rectangle(
-                                x1, y1, x2, y2,
-                                outline='#3498db',
-                                width=2,
-                                dash=(5, 3),
-                                tags='project_boundary'
-                            )
-
-                            # Draw origin marker (plus sign at 0,0)
-                            self._draw_origin_marker()
-
-                            # Update rulers
-                            self._update_rulers()
-                            self._log_info("Project rectangle drawn successfully")
-                            return  # Don't show text if we drew the rectangle
-                except (ValueError, IndexError) as e:
-                    self._log_error(f"Error drawing project rectangle: {e}")
-
-        elif item_type == 'region':
-            text = f"Region: {name}"
-            color = "#27ae60"
-        else:
-            text = f"{name}"
-            color = "#7f8c8d"
-
-        self.canvas.create_text(
-            center_x, center_y,
-            text=text,
-            font=("Arial", 20, "bold"),
-            fill=color,
-            justify=tk.CENTER
-        )
+        ws_elapsed = time.time() - ws_start
+        self._log_info(f"Update workspace completed in {ws_elapsed*1000:.1f}ms")
 
     def _start_tree_rename(self, event):
         """Start in-tree renaming (double-click on item)."""
@@ -1333,6 +1321,11 @@ class RegenesisGUI:
 
     def _on_drag_start(self, event):
         """Handle start of drag operation."""
+        # Record the starting position
+        self._drag_start_x = event.x
+        self._drag_start_y = event.y
+        self._has_moved = False
+
         item = self.tree.identify_row(event.y)
         if item:
             # Don't allow dragging the root node
@@ -1344,6 +1337,17 @@ class RegenesisGUI:
     def _on_drag_motion(self, event):
         """Handle drag motion - visual feedback."""
         if not self._drag_item:
+            return
+
+        # Check if the mouse has moved enough to be considered a drag
+        # Use a 5-pixel threshold to distinguish from clicks
+        dx = abs(event.x - self._drag_start_x)
+        dy = abs(event.y - self._drag_start_y)
+        if dx > 5 or dy > 5:
+            self._has_moved = True
+
+        # Only show drag feedback if we've actually moved
+        if not self._has_moved:
             return
 
         # Get the item under the cursor
@@ -1412,6 +1416,16 @@ class RegenesisGUI:
         if not self._drag_item:
             return
 
+        # If the user didn't actually drag (just clicked), let tree selection happen
+        if not self._has_moved:
+            # Reset drag state
+            self._drag_item = None
+            self._drop_target = None
+            self._drop_position = None
+            self._has_moved = False
+            # The click will trigger TreeviewSelect normally
+            return
+
         # Use the drop target and position determined during drag motion
         if self._drop_target and self._drop_position:
             target = self._drop_target
@@ -1461,6 +1475,7 @@ class RegenesisGUI:
         self._drag_item = None
         self._drop_target = None
         self._drop_position = None
+        self._has_moved = False
 
     def _is_descendant(self, parent_item, child_item):
         """Check if child_item is a descendant of parent_item."""
@@ -1638,6 +1653,136 @@ class RegenesisGUI:
                         except (ValueError, IndexError):
                             pass
 
+    def _find_project_root(self):
+        """Find the root project item in the tree."""
+        if not self.selected_item:
+            return None
+
+        # Walk up the tree to find the root project
+        current = self.selected_item
+        while self.tree.parent(current):
+            current = self.tree.parent(current)
+
+        return current
+
+    def _draw_project_rectangle(self, project_item, width, height, center_x, center_y):
+        """Draw the project boundary rectangle. Returns True if drawn, False otherwise."""
+        item_values = self.tree.item(project_item, 'values')
+        self._log_info(f"Drawing project rectangle: item_values={item_values}")
+
+        if not item_values or len(item_values) < 5:
+            self._log_warning(f"Cannot draw rectangle: insufficient values (got {len(item_values) if item_values else 0}, need 5)")
+            return False
+
+        try:
+            project_width_str = item_values[3]
+            project_length_str = item_values[4]
+
+            if not project_width_str or not project_length_str:
+                self._log_warning(f"Cannot draw rectangle: width or length is empty")
+                return False
+
+            project_width = float(project_width_str)
+            project_length = float(project_length_str)
+
+            self._log_info(f"Project dimensions: {project_width} x {project_length}")
+
+            if project_width <= 0 or project_length <= 0:
+                return False
+
+            # Convert to pixels (50 pixels = 1 unit at zoom 1.0, scaled by current zoom)
+            pixels_per_unit = 50 * self.canvas_zoom
+            rect_width = project_width * pixels_per_unit
+            rect_height = project_length * pixels_per_unit
+
+            # Center rectangle around canvas center (which represents 0,0 in project coords)
+            origin_x = center_x + self.canvas_pan_x
+            origin_y = center_y + self.canvas_pan_y
+
+            x1 = origin_x - rect_width / 2
+            y1 = origin_y - rect_height / 2
+            x2 = origin_x + rect_width / 2
+            y2 = origin_y + rect_height / 2
+
+            # Auto-zoom to fit rectangle if it's too large for canvas (only once per project)
+            if not self._has_auto_zoomed:
+                # Add 20% margin
+                required_width = rect_width * 1.2
+                required_height = rect_height * 1.2
+
+                # Calculate zoom needed to fit
+                zoom_for_width = width / required_width
+                zoom_for_height = height / required_height
+                auto_zoom = min(zoom_for_width, zoom_for_height)
+
+                # Respect zoom limits (0.01 to 10.0)
+                auto_zoom = max(0.01, min(10.0, auto_zoom))
+
+                # Only auto-zoom if rectangle is too large
+                if auto_zoom < self.canvas_zoom:
+                    self.canvas_zoom = auto_zoom
+                    self._log_info(f"Auto-zoomed to {auto_zoom:.3f} to fit rectangle")
+
+                    # Recalculate rectangle with new zoom
+                    pixels_per_unit = 50 * self.canvas_zoom
+                    rect_width = project_width * pixels_per_unit
+                    rect_height = project_length * pixels_per_unit
+
+                    x1 = origin_x - rect_width / 2
+                    y1 = origin_y - rect_height / 2
+                    x2 = origin_x + rect_width / 2
+                    y2 = origin_y + rect_height / 2
+
+                self._has_auto_zoomed = True
+
+            # Draw unfilled rectangle outline
+            self.canvas.create_rectangle(
+                x1, y1, x2, y2,
+                outline='#3498db',
+                width=2,
+                dash=(5, 3),
+                tags='project_boundary'
+            )
+
+            return True
+
+        except (ValueError, IndexError) as e:
+            self._log_error(f"Error drawing project rectangle: {e}")
+            return False
+
+    def _draw_all_region_polygons(self):
+        """Draw all saved region polygons (non-editable display)."""
+        for region_item, vertices in self.region_polygons.items():
+            # Skip the currently selected region if in drawing mode (it will be drawn editable)
+            if self.drawing_mode and region_item == self.selected_item:
+                continue
+
+            if len(vertices) < 3:
+                continue
+
+            # Draw the filled polygon
+            flat_coords = [coord for vertex in vertices for coord in vertex]
+            self.canvas.create_polygon(
+                flat_coords,
+                fill='#2ecc71',
+                outline='#27ae60',
+                width=2,
+                stipple='gray25',
+                tags=f'region_polygon_{region_item}'
+            )
+
+            # Draw vertices (small circles, max 10 pixels, scale down with zoom)
+            vertex_radius = min(10, max(3, 10 * self.canvas_zoom))
+            for vx, vy in vertices:
+                self.canvas.create_oval(
+                    vx - vertex_radius, vy - vertex_radius,
+                    vx + vertex_radius, vy + vertex_radius,
+                    fill='#27ae60',
+                    outline='#1e8449',
+                    width=1,
+                    tags=f'region_polygon_{region_item}'
+                )
+
     def _redraw_project_rectangle(self, project_width, project_length):
         """Redraw the project rectangle centered at the origin."""
         # Get current canvas dimensions
@@ -1720,36 +1865,107 @@ class RegenesisGUI:
         # Determine zoom direction
         if event.num == 5 or event.delta < 0:  # Scroll down / zoom out
             factor = 0.9
+            direction = "out"
         elif event.num == 4 or event.delta > 0:  # Scroll up / zoom in
             factor = 1.1
+            direction = "in"
         else:
             return
 
         # Limit zoom range
         new_zoom = self.canvas_zoom * factor
-        if new_zoom < 0.1 or new_zoom > 10.0:
+        if new_zoom < 0.01 or new_zoom > 10.0:
+            self._log_info(f"Zoom {direction} blocked - would exceed limits (new: {new_zoom:.3f})")
             return
 
-        # Get mouse position on canvas
-        x = self.canvas.canvasx(event.x)
-        y = self.canvas.canvasy(event.y)
+        self._log_info(f"Zooming {direction}: {self.canvas_zoom:.3f} -> {new_zoom:.3f}")
 
-        # Scale all items
+        # Get mouse position on canvas
+        mouse_x = event.x
+        mouse_y = event.y
+
+        # Get canvas dimensions
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        center_x = canvas_width / 2
+        center_y = canvas_height / 2
+
+        # Calculate the world position under the mouse before zoom
+        # world_pos = (screen_pos - center - pan) / pixels_per_unit
+        old_pixels_per_unit = 50 * self.canvas_zoom
+        world_x = (mouse_x - center_x - self.canvas_pan_x) / old_pixels_per_unit
+        world_y = (mouse_y - center_y - self.canvas_pan_y) / old_pixels_per_unit
+
+        # Scale all items (for polygons)
+        x = self.canvas.canvasx(mouse_x)
+        y = self.canvas.canvasy(mouse_y)
         self.canvas.scale('all', x, y, factor, factor)
 
         # Update zoom level
         self.canvas_zoom = new_zoom
 
-        # Update pan offset to maintain mouse position
-        self.canvas_pan_x = x * (1 - factor) + self.canvas_pan_x * factor
-        self.canvas_pan_y = y * (1 - factor) + self.canvas_pan_y * factor
+        # Calculate new pan offset to keep the world position under the mouse
+        # screen_pos = (world_pos * new_pixels_per_unit) + center + new_pan
+        # mouse = (world * new_pixels) + center + new_pan
+        # new_pan = mouse - center - (world * new_pixels)
+        new_pixels_per_unit = 50 * self.canvas_zoom
+        self.canvas_pan_x = mouse_x - center_x - (world_x * new_pixels_per_unit)
+        self.canvas_pan_y = mouse_y - center_y - (world_y * new_pixels_per_unit)
 
-        # Update rulers
+        # Update rulers (which will redraw origin marker and project rectangle)
         self._update_rulers()
+
+    def _fit_to_project_rectangle(self, project_width, project_length):
+        """Fit the canvas view to show the project rectangle."""
+        # Get canvas dimensions
+        self.canvas.update_idletasks()
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+
+        # Calculate required dimensions with 20% margin
+        required_width_units = project_width * 1.2
+        required_height_units = project_length * 1.2
+
+        # Calculate zoom needed to fit (pixels per unit at zoom 1.0 = 50)
+        zoom_for_width = canvas_width / (required_width_units * 50)
+        zoom_for_height = canvas_height / (required_height_units * 50)
+        target_zoom = min(zoom_for_width, zoom_for_height)
+
+        # Respect zoom limits
+        target_zoom = max(0.01, min(10.0, target_zoom))
+
+        # Reset pan to center
+        self.canvas_pan_x = 0
+        self.canvas_pan_y = 0
+        self.canvas_zoom = target_zoom
+
+        # Redraw everything at new zoom
+        self._update_rulers()
+
+        self._log_info(f"Fitted view to project rectangle at zoom {target_zoom:.3f}")
 
     def _fit_to_design_extents(self):
         """Fit the canvas view to show all project regions."""
         if not self.polygon_vertices:
+            # Check if we're viewing a project with dimensions
+            if self.selected_item:
+                item_values = self.tree.item(self.selected_item, 'values')
+                if item_values and len(item_values) > 0 and item_values[0] == 'project':
+                    if len(item_values) > 4:
+                        project_width_str = item_values[3]
+                        project_length_str = item_values[4]
+                        if project_width_str and project_length_str:
+                            try:
+                                project_width = float(project_width_str)
+                                project_length = float(project_length_str)
+                                if project_width > 0 and project_length > 0:
+                                    # Fit to project rectangle
+                                    self._fit_to_project_rectangle(project_width, project_length)
+                                    return
+                            except (ValueError, IndexError):
+                                pass
+
+            # No polygon or project rectangle to fit
             self._reset_view()
             self._log_info("No polygon to fit - reset to default view")
             return
@@ -1794,7 +2010,7 @@ class RegenesisGUI:
             target_zoom = min(zoom_x, zoom_y)
 
             # Limit zoom range
-            target_zoom = max(0.1, min(10.0, target_zoom))
+            target_zoom = max(0.01, min(10.0, target_zoom))
         else:
             target_zoom = 1.0
 
@@ -1892,20 +2108,8 @@ class RegenesisGUI:
 
     # Canvas Drawing Methods
 
-    def _toggle_drawing_mode(self):
-        """Toggle drawing mode on/off."""
-        if self.drawing_mode:
-            # Exit drawing mode
-            self.drawing_mode = False
-            self.draw_mode_button.config(text="Draw Rectangle", bootstyle="success")
-            self.canvas.config(cursor='')
-            self._log_info("Drawing mode disabled")
-        else:
-            # Enter drawing mode - create a default rectangle
-            self.drawing_mode = True
-            self.draw_mode_button.config(text="Exit Drawing", bootstyle="danger")
-            self._create_default_rectangle()
-            self._log_info("Drawing mode enabled - rectangle created")
+    # _toggle_drawing_mode removed - drawing mode now starts automatically when viewing a region
+    # and exits automatically when switching nodes
 
     def _create_default_rectangle(self):
         """Create a default rectangle in the center of the canvas."""
@@ -1961,6 +2165,10 @@ class RegenesisGUI:
 
         # Draw the polygon
         self._redraw_polygon()
+        # Show and enable the Clear Shape button when in drawing mode (only if not already visible)
+        if not self._clear_button_visible:
+            self.clear_polygon_button.pack(side=tk.LEFT, padx=5)
+            self._clear_button_visible = True
         self.clear_polygon_button.config(state=tk.NORMAL)
 
     def _clear_polygon(self):
@@ -2245,6 +2453,22 @@ class RegenesisGUI:
 
         # Redraw origin marker with updated position
         self._draw_origin_marker()
+
+        # Redraw project rectangle if we're viewing a project
+        if self.selected_item and not self.drawing_mode:
+            item_values = self.tree.item(self.selected_item, 'values')
+            if item_values and len(item_values) > 0 and item_values[0] == 'project':
+                if len(item_values) > 4:
+                    project_width_str = item_values[3]
+                    project_length_str = item_values[4]
+                    if project_width_str and project_length_str:
+                        try:
+                            project_width = float(project_width_str)
+                            project_length = float(project_length_str)
+                            if project_width > 0 and project_length > 0:
+                                self._redraw_project_rectangle(project_width, project_length)
+                        except (ValueError, IndexError):
+                            pass
 
         # Get dimensions
         canvas_width = self.canvas.winfo_width()
